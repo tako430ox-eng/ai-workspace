@@ -22,10 +22,13 @@ async function run<T>(
 ): Promise<T> {
   const db = await openDb()
   try {
+    // Resolve only when the whole transaction commits: a request can succeed
+    // and the transaction still abort (e.g. storage quota), losing the write.
     return await new Promise<T>((resolve, reject) => {
-      const req = action(db.transaction(STORE, mode).objectStore(STORE))
-      req.onsuccess = () => resolve(req.result as T)
-      req.onerror = () => reject(req.error)
+      const tx = db.transaction(STORE, mode)
+      const req = action(tx.objectStore(STORE))
+      tx.oncomplete = () => resolve(req.result as T)
+      tx.onabort = () => reject(tx.error ?? new DOMException('Transaction aborted', 'AbortError'))
     })
   } finally {
     db.close()
