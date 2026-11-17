@@ -1,90 +1,113 @@
-import { useEffect, useRef, useState } from 'react'
-import { copyText } from './clipboard'
-import { buildRequestText } from './prompt'
-import { clearDraft, loadDraft, saveDraft } from './storage'
-import { emptyDraft, type Draft } from './types'
+import { useEffect, useState } from 'react'
+import { listTasks, saveTask } from './storage'
+import { TaskDetail } from './TaskDetail'
+import { TaskList } from './TaskList'
+import { newTask, type Task } from './types'
 import './App.css'
 
-// Fictional sample so testing never needs real conversations.
-const sampleDraft: Draft = {
-  title: '【テスト】架空の買い物メモアプリ',
-  purpose: '架空の買い物メモアプリの画面案を考えたい(テスト用の例です)。',
-  context: 'スマホで片手操作できること。費用はかけない。',
-  question: '最初に作るべき画面を3つ挙げてください。',
-}
+// Where the user wants to go next: back to the list, or into a task.
+type Destination = { kind: 'list' } | { kind: 'task'; task: Task; isNew: boolean }
 
-const fields: { key: keyof Draft; label: string; rows: number }[] = [
-  { key: 'title', label: '作業名', rows: 1 },
-  { key: 'purpose', label: '目的', rows: 3 },
-  { key: 'context', label: '前提・制約', rows: 3 },
-  { key: 'question', label: '今回聞きたいこと', rows: 4 },
-]
+type Editing = { saved: Task; draft: Task; isNew: boolean }
 
-function formatTime(iso: string): string {
-  return new Date(iso).toLocaleString('ja-JP')
+const editableKeys = ['title', 'purpose', 'context', 'question', 'status', 'nextAction', 'memo'] as const
+
+function hasChanges({ saved, draft }: Editing): boolean {
+  return editableKeys.some((key) => saved[key] !== draft[key])
 }
 
 function App() {
-  const [draft, setDraft] = useState<Draft>(emptyDraft)
-  const [savedAt, setSavedAt] = useState<string>()
+  // undefined while the first load is running, so nothing can be edited
+  // (and overwritten by late-arriving data) before it finishes.
+  const [tasks, setTasks] = useState<Task[]>()
+  const [loadError, setLoadError] = useState(false)
+  const [editing, setEditing] = useState<Editing>()
+  const [pending, setPending] = useState<Destination>()
+  const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState('')
-  const [copyFailed, setCopyFailed] = useState(false)
-  const previewRef = useRef<HTMLTextAreaElement>(null)
-
-  const requestText = buildRequestText(draft)
 
   useEffect(() => {
-    loadDraft()
-      .then((saved) => {
-        if (!saved) return
-        const { savedAt, ...rest } = saved
-        setDraft(rest)
-        setSavedAt(savedAt)
-        setMessage(`前回保存した内容を読み込みました(${formatTime(savedAt)})`)
-      })
-      .catch(() => setMessage('端末内の保存データを読み込めませんでした。'))
+    listTasks()
+      .then(setTasks)
+      .catch(() => setLoadError(true))
   }, [])
 
-  function update(key: keyof Draft, value: string) {
-    setDraft((d) => ({ ...d, [key]: value }))
-  }
+  const dirty = editing ? hasChanges(editing) : false
 
-  async function handleCopy() {
-    if (!requestText) {
-      setMessage('依頼文が空です。先に入力してください。')
-      return
-    }
-    const ok = await copyText(requestText)
-    setCopyFailed(!ok)
-    if (ok) {
-      setMessage('依頼文をコピーしました。')
+  function go(destination: Destination) {
+    setPending(undefined)
+    setMessage('')
+    if (destination.kind === 'list') {
+      setEditing(undefined)
     } else {
-      setMessage('自動コピーできませんでした。下の依頼文を長押しで選択してコピーしてください。')
-      previewRef.current?.focus()
-      previewRef.current?.select()
+      const { task, isNew } = destination
+      setEditing({ saved: task, draft: task, isNew })
     }
   }
 
-  async function handleSave() {
+  function navigate(destination: Destination) {
+    if (dirty) setPending(destination)
+    else go(destination)
+  }
+
+  // Returns true only after the task is really stored.
+  async function save(): Promise<boolean> {
+    if (!editing) return false
+    if (!editing.draft.title.trim()) {
+      setMessage('作業名を入力してください。')
+      return false
+    }
+    setSaving(true)
     try {
-      const saved = await saveDraft(draft)
-      setSavedAt(saved.savedAt)
-      setMessage(`端末内に保存しました(${formatTime(saved.savedAt)})`)
+      const saved = await saveTask(editing.draft)
+      setTasks((current = []) =>
+        [saved, ...current.filter((t) => t.id !== saved.id)],
+      )
+      setEditing({ saved, draft: saved, isNew: false })
+      setMessage(`保存しました(${new Date(saved.updatedAt).toLocaleString('ja-JP')})`)
+      return true
     } catch {
-      setMessage('保存に失敗しました。')
+      setMessage('保存に失敗しました。入力内容は残っています。')
+      return false
+    } finally {
+      setSaving(false)
     }
   }
 
-  async function handleClear() {
-    if (!window.confirm('この端末に保存した内容を消します。よろしいですか?')) return
-    try {
-      await clearDraft()
-      setDraft(emptyDraft)
-      setSavedAt(undefined)
-      setMessage('保存した内容を消しました。')
-    } catch {
-      setMessage('消去に失敗しました。')
-    }
+  async function saveAndGo() {
+    if (!pending) return
+    const destination = pending
+    setPending(undefined)
+    if (await save()) go(destination)
+  }
+
+  let body
+  if (loadError) {
+    body = <p className="status">端末内の保存データを読み込めませんでした。ページを再読み込みしてください。</p>
+  } else if (!tasks) {
+    body = <p className="meta">読み込み中…</p>
+  } else if (editing) {
+    body = (
+      <TaskDetail
+        task={editing.draft}
+        isNew={editing.isNew}
+        dirty={dirty}
+        saving={saving}
+        message={message}
+        onChange={(draft) => setEditing({ ...editing, draft })}
+        onSave={save}
+        onBack={() => navigate({ kind: 'list' })}
+        onMessage={setMessage}
+      />
+    )
+  } else {
+    body = (
+      <TaskList
+        tasks={tasks}
+        onOpen={(task) => navigate({ kind: 'task', task, isNew: false })}
+        onCreate={() => navigate({ kind: 'task', task: newTask(), isNew: true })}
+      />
+    )
   }
 
   return (
@@ -94,43 +117,20 @@ function App() {
         APIキー・パスワード・個人情報は入力しないでください。
         試すときは「架空の例を入れる」を使ってください。
       </p>
-
-      <section className="card">
-        {fields.map(({ key, label, rows }) => (
-          <label key={key}>
-            <span>{label}</span>
-            {rows === 1 ? (
-              <input value={draft[key]} onChange={(e) => update(key, e.target.value)} />
-            ) : (
-              <textarea rows={rows} value={draft[key]} onChange={(e) => update(key, e.target.value)} />
-            )}
-          </label>
-        ))}
-        <button type="button" className="secondary" onClick={() => setDraft(sampleDraft)}>
-          架空の例を入れる
-        </button>
-      </section>
-
-      <section className="card">
-        <h2>依頼文</h2>
-        <textarea
-          ref={previewRef}
-          className={copyFailed ? 'preview highlight' : 'preview'}
-          rows={8}
-          readOnly
-          value={requestText}
-          placeholder="上に入力すると、ここに依頼文ができます。"
-        />
-        <div className="actions">
-          <button type="button" onClick={handleCopy}>依頼文をコピー</button>
-          <button type="button" onClick={handleSave}>端末に保存</button>
-          <button type="button" className="danger" onClick={handleClear}>保存を消す</button>
+      {body}
+      {pending && (
+        <div className="dialog-backdrop">
+          <div className="dialog" role="dialog" aria-modal="true" aria-labelledby="unsaved-title">
+            <h2 id="unsaved-title">保存していない変更があります</h2>
+            <p>移動する前に、変更をどうしますか?</p>
+            <div className="actions">
+              <button type="button" onClick={saveAndGo}>保存して移動</button>
+              <button type="button" className="danger" onClick={() => go(pending)}>破棄して移動</button>
+              <button type="button" className="secondary" onClick={() => setPending(undefined)}>キャンセル</button>
+            </div>
+          </div>
         </div>
-        <p className="status" role="status">{message}</p>
-        <p className="meta">
-          {savedAt ? `最終保存:${formatTime(savedAt)}` : 'まだ保存していません'}
-        </p>
-      </section>
+      )}
     </main>
   )
 }
